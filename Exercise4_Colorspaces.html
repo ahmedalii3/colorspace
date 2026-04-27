@@ -1,0 +1,917 @@
+<!DOCTYPE html>
+<!--
+    Exercise 4: Point-cloud style visualization of color spaces in Three.js/WebGL with WebXR support.
+
+    This exercise extends the color-space point-cloud visualization by adding a WebXR/VR mode.
+    The application samples pixels from an image or video texture, converts each sampled color
+    into a chosen color-space coordinate system, and displays the result as a 3D point cloud.
+
+    Main features:
+    - Shader-based conversion between RGB, HSV, CIEXYZ, CIExyY, CIELAB, and CIELCH.
+    - Point cloud and density visualization modes.
+    - Light and dark theme support.
+    - Button-based color-space selector.
+    - Reference image panel with image-space axes and tick labels.
+    - Fake shadow point cloud for spatial context.
+    - WebXR/VR support using VRButton.
+    - Controller rays and controller models in XR.
+    - HTMLMesh version of the DOM UI displayed inside the XR scene.
+    - contentRoot group used to scale and reposition the visualization when entering XR.
+-->
+<html lang="en">
+    <head>
+        <title>three.js webgl - color space point cloud</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+        <style>
+    /* General page style. The Three.js canvas fills the browser window. */
+    body {
+        margin: 0;
+        overflow: hidden;
+        background-color: #ccc;
+        color: #000;
+        font-family: Arial, sans-serif;
+    }
+
+    /* Floating DOM control panel used on desktop and later converted to an HTMLMesh in XR. */
+    #info {
+        position: absolute;
+        top: 10px;
+        left: 10px;
+        z-index: 10;
+        background: rgba(255,255,255,0.88);
+        padding: 10px;
+        border-radius: 6px;
+        transition: background 0.2s ease, color 0.2s ease;
+    }
+
+    /* Shared small UI element sizing. */
+    label, input, button {
+        font-size: 13px;
+    }
+
+    /* Basic button appearance. */
+    button {
+        padding: 6px 10px;
+        border: 1px solid #888;
+        border-radius: 5px;
+        background: #f5f5f5;
+        cursor: pointer;
+    }
+
+    /* Layout for the group of color-space buttons. */
+    .color-space-buttons {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 8px;
+    }
+
+    /* Highlight the currently active color-space button. */
+    .color-space-buttons button.active {
+        background: #dce9ff;
+        border-color: #4f7ddf;
+    }
+
+    /* Dark theme page styling. */
+    body.dark {
+        background-color: #111;
+        color: #eee;
+    }
+
+    body.dark #info {
+        background: rgba(20,20,20,0.88);
+        color: #eee;
+    }
+
+    body.dark button {
+        background: #222;
+        color: #eee;
+        border-color: #666;
+    }
+
+    body.dark .color-space-buttons button.active {
+        background: #294578;
+        border-color: #7da5ff;
+    }
+</style>
+    </head>
+
+    <body>
+
+        <!-- Desktop UI panel. In XR, this same element is rendered as an HTMLMesh. -->
+        <div id="info">
+            <label>Color Space:</label>
+            <div id="colorSpaceButtons" class="color-space-buttons">
+                <button type="button" data-color-space="0">RGB</button>
+                <button type="button" data-color-space="1">HSV</button>
+                <button type="button" data-color-space="2">CIEXYZ</button>
+                <button type="button" data-color-space="3">CIExyY</button>
+                <button type="button" data-color-space="4">CIELAB</button>
+                <button type="button" data-color-space="5">CIELCH</button>
+            </div>
+
+            <div style="margin-top:10px;">
+                <button id="viewModeBtn">Mode: Point Cloud</button>
+            </div>
+
+            <div style="margin-top:8px;">
+                <button id="themeBtn">Theme: Light</button>
+            </div>
+        </div>
+
+        <!--
+            Vertex shader for the point cloud.
+
+            Each point represents one sampled pixel from the texture. The shader:
+            1. Samples the pixel color using the custom UV attribute `aUv`.
+            2. Converts the sampled RGB color into the selected color space.
+            3. Uses the resulting color-space coordinates as the 3D position.
+            4. Sends the original RGB color to the fragment shader.
+        -->
+        <script type="x-shader/x-vertex" id="basicvertexshader">
+            varying vec3 vColor;
+            attribute vec2 aUv;
+            uniform float pointSizeScale;
+            uniform sampler2D tex;
+            uniform int colorSpace;
+            uniform float cloudScale;
+
+            const vec3 D65 = vec3(0.95047, 1.0, 1.08883);
+            const float PI = 3.14159265358979323846;
+
+            // Shader helpers: convert sampled sRGB values into alternate color-space coordinates.
+            vec3 srgbToLinear(vec3 c) {
+                vec3 lowPart = c / 12.92;
+                vec3 highPart = pow((c + 0.055) / 1.055, vec3(2.4));
+                return mix(lowPart, highPart, step(vec3(0.04045), c));
+            }
+
+            // Converts linear RGB to CIEXYZ using a D65 sRGB matrix.
+            vec3 linearRgbToXyz(vec3 rgb) {
+                mat3 M = mat3(
+                    0.4124564, 0.2126729, 0.0193339,
+                    0.3575761, 0.7151522, 0.1191920,
+                    0.1804375, 0.0721750, 0.9503041
+                );
+                return M * rgb;
+            }
+
+            // Converts RGB to HSV with hue normalized to [0, 1].
+            vec3 rgbToHsv(vec3 c) {
+                float cmax = max(c.r, max(c.g, c.b));
+                float cmin = min(c.r, min(c.g, c.b));
+                float d = cmax - cmin;
+
+                float h = 0.0;
+                if (d > 0.00001) {
+                    if (cmax == c.r) {
+                        h = mod((c.g - c.b) / d, 6.0);
+                    } else if (cmax == c.g) {
+                        h = ((c.b - c.r) / d) + 2.0;
+                    } else {
+                        h = ((c.r - c.g) / d) + 4.0;
+                    }
+                    h /= 6.0;
+                    if (h < 0.0) h += 1.0;
+                }
+
+                float s = (cmax <= 0.0) ? 0.0 : d / cmax;
+                float v = cmax;
+                return vec3(h, s, v);
+            }
+
+            // Converts CIEXYZ to CIExyY: chromaticity x/y plus luminance Y.
+            vec3 xyzToXyY(vec3 xyz) {
+                float sumXYZ = xyz.x + xyz.y + xyz.z;
+                if (sumXYZ <= 0.000001) return vec3(0.0);
+                return vec3(xyz.x / sumXYZ, xyz.y / sumXYZ, xyz.y);
+            }
+
+            // Nonlinear helper used for XYZ to CIELAB conversion.
+            float fLab(float t) {
+                float delta = 6.0 / 29.0;
+                float delta3 = delta * delta * delta;
+                if (t > delta3) {
+                    return pow(t, 1.0 / 3.0);
+                }
+                return t / (3.0 * delta * delta) + 4.0 / 29.0;
+            }
+
+            // Converts CIEXYZ to CIELAB using D65 reference white.
+            vec3 xyzToLab(vec3 xyz) {
+                float fx = fLab(xyz.x / D65.x);
+                float fy = fLab(xyz.y / D65.y);
+                float fz = fLab(xyz.z / D65.z);
+                float L = 116.0 * fy - 16.0;
+                float a = 500.0 * (fx - fy);
+                float b = 200.0 * (fy - fz);
+                return vec3(L, a, b);
+            }
+
+            // Converts CIELAB to CIELCH. Hue is normalized to [0, 1].
+            vec3 labToLch(vec3 lab) {
+                float C = sqrt(lab.y * lab.y + lab.z * lab.z);
+                float h = atan(lab.z, lab.y);
+                if (h < 0.0) h += 2.0 * PI;
+                return vec3(lab.x, C, h / (2.0 * PI));
+            }
+
+            // Selects which color-space coordinate system drives the point position.
+            vec3 getPositionInColorSpace(vec3 srgb) {
+                vec3 linear = srgbToLinear(srgb);
+                vec3 xyz = linearRgbToXyz(linear);
+                vec3 xyy = xyzToXyY(xyz);
+                vec3 lab = xyzToLab(xyz);
+                vec3 lch = labToLch(lab);
+                vec3 hsv = rgbToHsv(srgb);
+
+                // if (colorSpace == 0) return (linear - 0.5) * 2.0;
+                if (colorSpace == 0) return (linear);
+                // if (colorSpace == 1) return (hsv - 0.5) * 2.0;
+                if (colorSpace == 1) return (hsv);
+                // if (colorSpace == 2) return (xyz - 0.5) * 2.2;
+                if (colorSpace == 2) return (xyz);
+                // if (colorSpace == 3) return vec3((xyy.x - 0.33) * 5.0, (xyy.y - 0.33) * 5.0, (xyy.z - 0.5) * 2.0);
+                if (colorSpace == 3) return vec3((xyy.x) , (xyy.y ) , (xyy.z ));
+                if (colorSpace == 4) return vec3((lab.x / 100.0 - 0.5) * 2.0, lab.y / 128.0, lab.z / 128.0);
+                
+                // return vec3((lch.x / 100.0 - 0.5) * 2.0, (lch.y / 150.0) * 2.0 - 1.0, (lch.z - 0.5) * 2.0);
+                 return vec3((lch.x / 100.0 - 0.5) * 2.0, (lch.y / 150.0) * 2.0 - 1.0, (lch.z ));
+            }
+
+                // Vertex entry point: samples media color, maps it to 3D position, and sets point size.
+                void main() {
+                    vec3 color = texture2D(tex, aUv).rgb;
+                    //vec3 color;
+
+                    //if (aUv.x < 0.5) {
+                    //  color = vec3(1.0, 0.0, 0.0); // red
+                    //} else {
+                    //  color = vec3(0.0, 1.0, 0.0); // green
+                    //}
+                    vec3 pos = getPositionInColorSpace(color);
+                    vColor = color;
+
+                    // Convert the color-space coordinate into camera space.
+                    vec4 mvPosition = modelViewMatrix * vec4(pos * cloudScale, 1.0);
+
+                    // Make points smaller with distance so the cloud remains readable.
+                    float autoPointSize = 20.0 / max(0.1, -mvPosition.z);
+                    
+                    gl_PointSize = clamp(autoPointSize * pointSizeScale, 1.0, 100.0);
+                    gl_Position = projectionMatrix * mvPosition;
+                }
+            </script>
+
+        <!-- Fragment shader for the visible colored points. -->
+        <script type="x-shader/x-fragment" id="basicfragmentshader">
+
+            varying vec3 vColor;
+            uniform float pointAlpha;
+            void main() {
+                // Round point sprites by discarding fragments outside a circle.
+                vec2 c = gl_PointCoord - vec2(0.5);
+                if (dot(c, c) > 0.25) discard;
+                gl_FragColor = vec4(vColor, pointAlpha);
+            }
+
+        </script>
+
+        <!-- Fragment shader for the grey fake shadow point cloud. -->
+        <script type="x-shader/x-fragment" id="shadowfragmentshader">
+            varying vec3 vColor;
+
+            void main() {
+                vec2 c = gl_PointCoord - vec2(0.5);
+                if (dot(c, c) > 0.25) discard;
+
+                gl_FragColor = vec4(0.5, 0.5, 0.5, 0.06);
+            }
+        </script>
+
+        <!-- ES module shim for import map compatibility. -->
+        <script async src="https://unpkg.com/es-module-shims@1.3.6/dist/es-module-shims.js"></script>
+
+        <!-- Import map for Three.js core and addons, including WebXR and interactive UI helpers. -->
+        <script type="importmap">
+          {
+            "imports": {
+              "three": "https://unpkg.com/three@0.172.0/build/three.module.js",
+"three/addons/": "https://unpkg.com/three@0.172.0/examples/jsm/"
+            }
+          }
+        </script>
+
+        <script type="module">
+            import * as THREE from 'three';
+            import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+            import { BoxLineGeometry } from 'three/addons/geometries/BoxLineGeometry.js';
+            import { VRButton } from 'three/addons/webxr/VRButton.js';
+            import { HTMLMesh } from 'three/addons/interactive/HTMLMesh.js';
+            import { InteractiveGroup } from 'three/addons/interactive/InteractiveGroup.js';
+            import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+
+            // Axis labels for each supported color-space mode.
+            const axisLabelsByColorSpace = {
+
+                0: ['R', 'G', 'B'],
+                1: ['H', 'S', 'V'],
+                2: ['X', 'Y', 'Z'],
+                3: ['x', 'y', 'Y'],
+                4: ['L*', 'a*', 'b*'],
+                5: ['L*', 'C*', 'h']
+
+            };
+
+            // Main scene objects and visualization objects.
+            let camera, controls, scene, renderer;
+            let room, pointCloud,pointCloudShadow, referenceImage, shaderMaterial,shadowMaterial,floorMesh;
+            let axesHelper, axisLabelGroup;
+            let currentViewMode = 'point';
+            let currentTheme = 'light';
+            let currentColorSpace = 0;
+            let roomMaterial;
+
+            // Root group for all visualization content.
+            // This makes it easy to move/scale the whole scene when entering XR.
+            let contentRoot;
+
+            // 3D version of the HTML UI used inside XR.
+            let uiMesh;
+
+            init();
+
+            // Loads an image/video source and returns a configured texture plus media metadata.
+            function loadMediaTexture(url, onLoad, onError) {
+                const lower = url.toLowerCase();
+
+                const imageExts = ['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif'];
+                const videoExts = ['.mp4', '.webm', '.ogg', '.mov', '.m4v'];
+
+                const isImage = imageExts.some(ext => lower.endsWith(ext));
+                const isVideo = videoExts.some(ext => lower.endsWith(ext));
+
+                // Image path: use TextureLoader.
+                if (isImage) {
+                    const loader = new THREE.TextureLoader();
+                    loader.load(
+                        url,
+                        function(texture) {
+                            texture.minFilter = THREE.LinearFilter;
+                            texture.magFilter = THREE.LinearFilter;
+                            texture.needsUpdate = true;
+
+                            onLoad({
+                                texture: texture,
+                                width: texture.image.width,
+                                height: texture.image.height,
+                                type: 'image',
+                                element: texture.image
+                            });
+                        },
+                        undefined,
+                        function(err) {
+                            if (onError) onError(err);
+                        }
+                    );
+                    return;
+                }
+
+                // Video path: create a video element and wrap it in a VideoTexture.
+                if (isVideo) {
+                    const video = document.createElement('video');
+                    video.src = url;
+                    video.crossOrigin = 'anonymous';
+                    video.loop = true;
+                    video.muted = true;
+                    video.playsInline = true;
+                    video.autoplay = true;
+                    video.preload = 'auto';
+
+                    const onVideoReady = function() {
+                        const texture = new THREE.VideoTexture(video);
+                        texture.minFilter = THREE.LinearFilter;
+                        texture.magFilter = THREE.LinearFilter;
+                        texture.generateMipmaps = false;
+                        texture.needsUpdate = true;
+
+                        onLoad({
+                            texture: texture,
+                            width: video.videoWidth,
+                            height: video.videoHeight,
+                            type: 'video',
+                            element: video
+                        });
+
+                        video.play().catch(err => {
+                            console.warn('Video play was blocked or failed:', err);
+                        });
+                    };
+
+                    video.addEventListener('loadeddata', onVideoReady, { once: true });
+                    video.addEventListener('error', function(err) {
+                        if (onError) onError(err);
+                    });
+
+                    video.load();
+                    return;
+                }
+
+                // Unsupported media fallback.
+                if (onError) {
+                    onError(new Error('Unsupported file type: ' + url));
+                }
+            }
+
+            // Rebuilds 3D axis labels to match the currently selected color space.
+            function update3DAxisLabels(colorSpaceIndex) {
+                if (axisLabelGroup) contentRoot.remove(axisLabelGroup);
+
+                axisLabelGroup = new THREE.Group();
+
+                const labels = axisLabelsByColorSpace[colorSpaceIndex] || ['X', 'Y', 'Z'];
+                const axisLength = 3.2;
+
+                const xLabel = createTextSprite(labels[0]);
+                xLabel.position.set(axisLength, 0, 0);
+                axisLabelGroup.add(xLabel);
+
+                const yLabel = createTextSprite(labels[1]);
+                yLabel.position.set(0, axisLength, 0);
+                axisLabelGroup.add(yLabel);
+
+                const zLabel = createTextSprite(labels[2]);
+                zLabel.position.set(0, 0, axisLength);
+                axisLabelGroup.add(zLabel);
+
+                // Rotate labels to match the z-up/VR-oriented content layout.
+                axisLabelGroup.rotation.x = -Math.PI / 2;
+                contentRoot.add(axisLabelGroup);
+            }
+
+            // Initializes scene content, media visualizations, UI events, and XR rendering.
+            function init() {
+                console.log(THREE.REVISION);
+                
+                scene = new THREE.Scene();
+                scene.background = new THREE.Color(0xffffff);
+
+                // All visual objects are added to this group so the whole visualization can be transformed together.
+                contentRoot = new THREE.Group();
+                scene.add(contentRoot);
+
+                camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 50);
+                camera.position.set(4, 5, 4);
+
+                const light = new THREE.DirectionalLight(0x888888, 1);
+                light.position.set(10, 7, 5);
+                scene.add(light);
+
+                // Wireframe room material and room box.
+                roomMaterial = new THREE.LineBasicMaterial({ color: 0x808080 });
+
+                room = new THREE.LineSegments(
+                    new BoxLineGeometry(8, 8, 8, 8, 8, 8),
+                    roomMaterial
+                );
+                contentRoot.add(room);
+
+                // Simple floor plane for spatial reference.
+                const floorGeometry = new THREE.PlaneGeometry(8, 8);
+
+                const floorMaterial = new THREE.MeshBasicMaterial({
+
+                    color: 0xe8e8e8,
+                    side: THREE.DoubleSide,
+                    depthWrite: true
+
+                });
+
+                floorMesh = new THREE.Mesh(floorGeometry, floorMaterial);
+                floorMesh.rotation.x = -Math.PI / 2;
+                floorMesh.position.set(0, -0.55, 0);
+                contentRoot.add(floorMesh);
+
+                // Axes helper rotated into the same orientation as the content.
+                axesHelper = new THREE.AxesHelper(3);
+                axesHelper.rotation.x = -Math.PI / 2;
+                contentRoot.add(axesHelper);
+
+                // Renderer with XR enabled.
+                renderer = new THREE.WebGLRenderer({ antialias: true });
+                renderer.setPixelRatio(window.devicePixelRatio);
+                renderer.setSize(window.innerWidth, window.innerHeight);
+                renderer.xr.enabled = true;
+                renderer.setAnimationLoop(render);
+                document.body.appendChild(renderer.domElement);
+                document.body.appendChild(VRButton.createButton(renderer));
+
+                // Orbit controls for non-XR desktop viewing.
+                controls = new OrbitControls(camera, renderer.domElement);
+                controls.enableDamping = true;
+                controls.dampingFactor = 0.05;
+                controls.screenSpacePanning = true;
+                controls.minDistance = 1;
+                controls.maxDistance = 50;
+
+                update3DAxisLabels(0);
+
+                // Load initial media texture and create the visualization.
+                loadMediaTexture(
+                    'grenouille-gaus.jpg',
+                    // 'video.mp4',
+                    function(media) {
+                        createPointCloud(media.texture, media.width, media.height);
+                        createReferenceImage(media.texture, media.width, media.height);
+                        applyViewMode('point');
+                        applyTheme('light');
+                    },
+                    function(err) {
+                        console.error('Media load failed:', err);
+                    }
+                );
+
+                // Add XR controller interaction and 3D UI.
+                setupXRUI();
+                
+
+                // Color-space button handlers.
+                const colorSpaceButtons = document.querySelectorAll('#colorSpaceButtons button');
+                colorSpaceButtons.forEach((button) => {
+                    button.addEventListener('click', function() {
+                        const value = parseInt(button.dataset.colorSpace, 10);
+                        updateColorSpace(value);
+                    });
+                });
+
+                // Toggle point cloud / density mode.
+                document.getElementById('viewModeBtn').addEventListener('click', function() {
+                    if (currentViewMode === 'point') {
+                        applyViewMode('density');
+                    } else {
+                        applyViewMode('point');
+                    }
+                });
+
+                // Toggle light/dark theme.
+                document.getElementById('themeBtn').addEventListener('click', function() {
+                    if (currentTheme === 'light') {
+                        applyTheme('dark');
+                    } else {
+                        applyTheme('light');
+                    }
+                });
+
+                updateColorSpace(0);
+
+                window.addEventListener('resize', onWindowResize, false);
+            }
+
+            // Creates XR controller interaction and mounts the HTML control panel in XR.
+            function setupXRUI() {
+                // Controller ray geometry, used to show where each controller is pointing.
+                const geometry = new THREE.BufferGeometry();
+                geometry.setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -5)]);
+
+                // First XR controller with visible ray.
+                const controller1 = renderer.xr.getController(0);
+                controller1.add(new THREE.Line(geometry));
+                scene.add(controller1);
+
+                // Second XR controller with visible ray.
+                const controller2 = renderer.xr.getController(1);
+                controller2.add(new THREE.Line(geometry));
+                scene.add(controller2);
+
+                // Add visual controller models to controller grips.
+                const controllerModelFactory = new XRControllerModelFactory();
+
+                const controllerGrip1 = renderer.xr.getControllerGrip(0);
+                controllerGrip1.add(controllerModelFactory.createControllerModel(controllerGrip1));
+                scene.add(controllerGrip1);
+
+                const controllerGrip2 = renderer.xr.getControllerGrip(1);
+                controllerGrip2.add(controllerModelFactory.createControllerModel(controllerGrip2));
+                scene.add(controllerGrip2);
+
+                // InteractiveGroup allows pointer/controller interaction with HTMLMesh.
+                const group = new InteractiveGroup();
+                group.listenToPointerEvents(renderer, camera);
+                group.listenToXRControllerEvents(controller1);
+                group.listenToXRControllerEvents(controller2);
+                scene.add(group);
+
+                // Convert the DOM UI panel into a 3D mesh for XR interaction.
+                uiMesh = new HTMLMesh(document.getElementById('info'));
+                uiMesh.position.set(-0.95, 1.1, -0.8);
+                uiMesh.rotation.y = Math.PI / 4;
+                uiMesh.scale.setScalar(1.5);
+                uiMesh.visible = false;
+                group.add(uiMesh);
+
+                // When entering XR, show the 3D UI and move/scale the visualization closer to the user.
+                renderer.xr.addEventListener('sessionstart', () => {
+                    uiMesh.visible = true;
+                    controls.enabled = false;
+                    contentRoot.scale.setScalar(0.45);
+                    contentRoot.position.set(0, -0.15, -0.9);
+                });
+
+                // When leaving XR, hide the 3D UI and restore desktop view settings.
+                renderer.xr.addEventListener('sessionend', () => {
+                    uiMesh.visible = false;
+                    controls.enabled = true;
+                    contentRoot.scale.setScalar(1.0);
+                    contentRoot.position.set(0, 0, 0);
+                });
+            }
+
+            // Returns dimensions for both image and video textures.
+            function getTextureSize(texture) {
+
+                        const img = texture.image;
+                        if (img.videoWidth && img.videoHeight) {
+                            return { width: img.videoWidth, height: img.videoHeight };
+                        }
+                        return { width: img.width, height: img.height };
+
+                    }
+
+                    // Switches between point-cloud and additive density rendering modes.
+                    function applyViewMode(mode) {
+            currentViewMode = mode;
+
+            if (!shaderMaterial) return;
+
+            if (mode === 'point') {
+                // Point-cloud mode: opaque points and normal blending.
+                shaderMaterial.uniforms.pointSizeScale.value = 1.0;
+                shaderMaterial.uniforms.pointAlpha.value = 1.0;
+                shaderMaterial.blending = THREE.NormalBlending;
+                shaderMaterial.depthWrite = true;
+                shaderMaterial.depthTest = true;
+                document.getElementById('viewModeBtn').textContent = 'Mode: Point Cloud';
+            } else {
+                // Density mode: larger transparent points and additive blending.
+                shaderMaterial.uniforms.pointSizeScale.value = 2.8;
+                shaderMaterial.uniforms.pointAlpha.value = 0.06;
+                shaderMaterial.blending = THREE.AdditiveBlending;
+                shaderMaterial.depthWrite = false;
+                shaderMaterial.depthTest = true;
+                document.getElementById('viewModeBtn').textContent = 'Mode: Density';
+            }
+
+            shaderMaterial.needsUpdate = true;
+
+            // Refresh the XR UI texture so text/buttons update inside VR.
+            if (uiMesh) uiMesh.material.map.update();
+        }
+
+        // Updates active color-space uniforms and refreshes axis labels/button states.
+        function updateColorSpace(value) {
+            currentColorSpace = value;
+            if (shaderMaterial) shaderMaterial.uniforms.colorSpace.value = value;
+            if (shadowMaterial) shadowMaterial.uniforms.colorSpace.value = value;
+            update3DAxisLabels(value);
+            const colorSpaceButtons = document.querySelectorAll('#colorSpaceButtons button');
+            colorSpaceButtons.forEach((button) => {
+                button.classList.toggle('active', parseInt(button.dataset.colorSpace, 10) === value);
+            });
+            if (uiMesh) uiMesh.material.map.update();
+        }
+
+        // Applies light/dark theme styling to both DOM controls and scene visuals.
+        function applyTheme(theme) {
+            currentTheme = theme;
+
+            const body = document.body;
+            const info = document.getElementById('info');
+            const themeBtn = document.getElementById('themeBtn');
+
+            if (theme === 'light') {
+                body.classList.remove('dark');
+                scene.background = new THREE.Color(0xffffff);
+                if (roomMaterial) roomMaterial.color.set(0x808080);
+                themeBtn.textContent = 'Theme: Light';
+            } else {
+                body.classList.add('dark');
+                scene.background = new THREE.Color(0x111111);
+                if (roomMaterial) roomMaterial.color.set(0xaaaaaa);
+                themeBtn.textContent = 'Theme: Dark';
+            }
+
+            // Update HTMLMesh texture after DOM style/text changes.
+            if (uiMesh) uiMesh.material.map.update();
+        }
+
+                // Builds the point cloud geometry and shader materials from media pixels.
+                function createPointCloud(texture) {
+                    const { width, height } = getTextureSize(texture);
+                    const discret = 4;
+                const nx = Math.floor(width / discret);
+                const ny = Math.floor(height / discret);
+                const count = nx * ny;
+
+                // Dummy position buffer. Actual positions are computed in the vertex shader.
+                const positions = new Float32Array(count * 3);
+
+                // Custom UV buffer used by the shader to sample the correct texture pixel.
+                const uvs = new Float32Array(count * 2);
+
+                let id3 = 0;
+                let id2 = 0;
+                for (let j = 0; j < ny; j++) {
+                    for (let i = 0; i < nx; i++) {
+                        positions[id3++] = 0;
+                        positions[id3++] = 0;
+                        positions[id3++] = 0;
+
+                        uvs[id2++] = i / (nx - 1);
+                        uvs[id2++] = 1.0 - j / (ny - 1);
+                    }
+                }
+
+                const geometry = new THREE.BufferGeometry();
+                geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                geometry.setAttribute('aUv', new THREE.BufferAttribute(uvs, 2));
+
+                    // Main shader material for colored points.
+                    shaderMaterial = new THREE.ShaderMaterial({
+                    vertexShader: document.querySelector('#basicvertexshader').textContent.trim(),
+                    fragmentShader: document.querySelector('#basicfragmentshader').textContent.trim(),
+                        uniforms: {
+                            tex: { value: texture },
+                            colorSpace: { value: 0 },
+                            cloudScale: { value: 2.0 },
+                            pointSizeScale: { value: 1.0 },
+                            pointAlpha: { value: 1.0 }
+                        },
+                        transparent: true,
+                        depthTest: true,
+                        depthWrite: true,
+                        // side: THREE.DoubleSide
+                    });
+
+                    pointCloud = new THREE.Points(geometry, shaderMaterial);
+                    const imagePanelWidth = 2.4;
+                    const imagePanelHeight = imagePanelWidth * (height / width);
+                    // pointCloud.position.set(imagePanelWidth * 0.5, imagePanelHeight * 0.5, 2.0);
+                    pointCloud.position.set(0, 0.4, 0);
+                    pointCloud.rotation.x = -Math.PI / 2;
+                    pointCloud.renderOrder = 10;
+                    
+                    pointCloud.frustumCulled = false;
+                    contentRoot.add(pointCloud);
+
+                    // Shadow material reuses the same vertex shader so the shadow follows the same color-space shape.
+                    shadowMaterial = new THREE.ShaderMaterial({
+    vertexShader: document.querySelector('#basicvertexshader').textContent.trim(),
+    fragmentShader: document.querySelector('#shadowfragmentshader').textContent.trim(),
+    uniforms: {
+        tex: { value: texture },
+        colorSpace: { value: 0 },
+        cloudScale: { value: 2.0 }
+    },
+    transparent: true,
+    depthTest: true,
+    depthWrite: false
+});
+
+pointCloudShadow = new THREE.Points(geometry, shadowMaterial);
+
+// offset the fake shadow a little
+pointCloudShadow.position.set(0.35, -0.53, 0.18);
+pointCloudShadow.rotation.x = -Math.PI / 2;
+pointCloudShadow.scale.set(1.0, 1.0, 0.03);
+
+pointCloudShadow.renderOrder = 1;
+pointCloudShadow.frustumCulled = false;
+
+contentRoot.add(pointCloudShadow);
+                }
+
+                // Creates the image reference panel displayed near the point cloud.
+                function createReferenceImage(texture) {
+                    const { width, height } = getTextureSize(texture);
+                    const aspect = height / width;
+                    const panelWidth = 2.4;
+                    const panelHeight = panelWidth * aspect;
+
+                    const imageGeometry = new THREE.PlaneGeometry(panelWidth, panelHeight);
+                    // Anchor plane at a corner instead of its center.
+                    imageGeometry.translate(panelWidth * 0.5, panelHeight * 0.5, 0);
+                    const imageMaterial = new THREE.MeshBasicMaterial({
+                        map: texture,
+                        side: THREE.DoubleSide,
+
+                        depthTest: false,
+                        depthWrite: false
+                    });
+
+                    referenceImage = new THREE.Mesh(imageGeometry, imageMaterial);
+                    referenceImage.position.set(3.0, 0.0, 0.4);
+                    referenceImage.lookAt(0, 0, 0.25);
+                    referenceImage.add(createImageAxes(panelWidth, panelHeight, 4));
+                    referenceImage.renderOrder = 0;
+                    contentRoot.add(referenceImage);
+                }
+
+                // Draws image-space axes, ticks, and numeric labels on the reference panel.
+                function createImageAxes(panelWidth, panelHeight, ticks) {
+                    const group = new THREE.Group();
+                    const zOffset = 0.01;
+
+                    const xAxisGeometry = new THREE.BufferGeometry().setFromPoints([
+                        new THREE.Vector3(0, 0, zOffset),
+                        new THREE.Vector3(panelWidth, 0, zOffset)
+                    ]);
+                    const yAxisGeometry = new THREE.BufferGeometry().setFromPoints([
+                        new THREE.Vector3(0, 0, zOffset),
+                        new THREE.Vector3(0, panelHeight, zOffset)
+                    ]);
+
+                    const xAxis = new THREE.Line(xAxisGeometry, new THREE.LineBasicMaterial({ color: 0xff3333 }));
+                    const yAxis = new THREE.Line(yAxisGeometry, new THREE.LineBasicMaterial({ color: 0x22aa22 }));
+                    group.add(xAxis);
+                    group.add(yAxis);
+
+                    const tickSize = 0.035;
+                    for (let i = 0; i <= ticks; i++) {
+                        const t = i / ticks;
+                        const x = panelWidth * t;
+                        const y = panelHeight * t;
+
+                        const xTickGeom = new THREE.BufferGeometry().setFromPoints([
+                            new THREE.Vector3(x, 0, zOffset),
+                            new THREE.Vector3(x, -tickSize, zOffset)
+                        ]);
+                        group.add(new THREE.Line(xTickGeom, new THREE.LineBasicMaterial({ color: 0x222222 })));
+
+                        const yTickGeom = new THREE.BufferGeometry().setFromPoints([
+                            new THREE.Vector3(0, y, zOffset),
+                            new THREE.Vector3(-tickSize, y, zOffset)
+                        ]);
+                        group.add(new THREE.Line(yTickGeom, new THREE.LineBasicMaterial({ color: 0x222222 })));
+
+                        const xLabel = createTextSprite(t.toFixed(2));
+                        xLabel.position.set(x, -0.095, zOffset + 0.01);
+                        group.add(xLabel);
+
+                        const yLabel = createTextSprite(t.toFixed(2));
+                        yLabel.position.set(-0.11, y, zOffset + 0.01);
+                        group.add(yLabel);
+                    }
+
+                    const xTitle = createTextSprite('X');
+                    xTitle.position.set(panelWidth + 0.08, 0.0, zOffset + 0.01);
+                    group.add(xTitle);
+
+                    const yTitle = createTextSprite('Y');
+                    yTitle.position.set(0.0, panelHeight + 0.08, zOffset + 0.01);
+                    group.add(yTitle);
+
+                    return group;
+                }
+
+                // Renders short text into a sprite used for axis/tick labels.
+                function createTextSprite(text) {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = 160;
+                    canvas.height = 80;
+                    const ctx = canvas.getContext('2d');
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    ctx.fillStyle = '#111111';
+                    ctx.font = '112px Arial';
+                    ctx.textAlign = 'center';
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+                    const texture = new THREE.CanvasTexture(canvas);
+                    texture.needsUpdate = true;
+                    const material = new THREE.SpriteMaterial({
+                        map: texture,
+                        transparent: true,
+                        depthTest: false
+                    });
+                    const sprite = new THREE.Sprite(material);
+                    sprite.scale.set(0.18, 0.09, 1);
+                    return sprite;
+                }
+
+            // Keeps camera projection and renderer size aligned with viewport changes.
+            function onWindowResize() {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            }
+
+            // Renders one frame and refreshes XR HTML mesh texture when visible.
+            function render() {
+                controls.update();
+                if (uiMesh && uiMesh.visible) uiMesh.material.map.update();
+                renderer.render(scene, camera);
+            }
+        </script>
+    </body>
+</html>
